@@ -1,11 +1,14 @@
 name: Build APK
 
 # Cách dùng: đẩy file AiManager.zip (source) + file này (.github/workflows/build.yml) lên repo.
-# Workflow sẽ tự giải nén file .zip ở thư mục gốc repo rồi build ra APK đã ký.
+# Workflow tự giải nén file .zip ở thư mục gốc repo, build APK đã ký và đăng lên Releases.
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: write   # cần để tạo Release
 
 jobs:
   build:
@@ -23,7 +26,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Giải nén source (.zip)
+      - name: Unzip source
         run: |
           ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1)
           if [ -z "$ZIP" ]; then
@@ -42,42 +45,75 @@ jobs:
           ROOT=$(dirname "$SETTINGS")
           echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "Project root: $ROOT"
-          find "$ROOT" -maxdepth 3 -not -path '*/.git/*' | sort | head -n 60
 
-      - name: Cài JDK 17
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Cài Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses (ghi file license, không cần sdkmanager)
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "SDK: $SDK"
+          sudo mkdir -p "$SDK/licenses"
+          printf '%s\n' \
+            "8933bad161af4178b1185d1a37fbf41ea5269c55" \
+            "d56f5187479451eabf01fb78af6dfcb131a6481e" \
+            "24333f8a63b6825ea9c5514f83c2829b004d1fee" \
+            | sudo tee "$SDK/licenses/android-sdk-license" > /dev/null
+          printf '%s\n' "84831b9409646a918e30573bab4c9c91346d8abd" \
+            | sudo tee "$SDK/licenses/android-sdk-preview-license" > /dev/null
+          ls -l "$SDK/licenses"
 
-      - name: Cài Gradle 8.7
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.7"
-
-      - name: Khôi phục keystore
+      - name: Restore keystore
         run: |
           mkdir -p "$PROJECT_ROOT/app/keystore"
           echo "$KEYSTORE_BASE64" | base64 -d > "$PROJECT_ROOT/app/keystore/aimanager.jks"
           keytool -list -keystore "$PROJECT_ROOT/app/keystore/aimanager.jks" -storepass "$KEYSTORE_PASSWORD" | head -n 6
 
-      - name: Build APK (release, đã ký)
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build release APK
         run: |
           cd "$PROJECT_ROOT"
           gradle assembleRelease --no-daemon --stacktrace
 
-      - name: Đổi tên APK
+      - name: Verify signature
+        run: |
+          APK=$(ls "$PROJECT_ROOT"/app/build/outputs/apk/release/*.apk | head -n 1)
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER=$(ls "$SDK"/build-tools/*/apksigner | sort -V | tail -n 1)
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | head -n 12
+
+      - name: Prepare APK
         run: |
           mkdir -p dist
           cp "$PROJECT_ROOT"/app/build/outputs/apk/release/*.apk "dist/QuanLyAI-${{ github.run_number }}.apk"
           ls -lh dist
 
-      - name: Tải APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: QuanLyAI-apk
           path: dist/*.apk
           if-no-files-found: error
+
+      - name: Upload R8 mapping (giải mã stacktrace khi cần)
+        uses: actions/upload-artifact@v4
+        with:
+          name: R8-mapping
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn
+
+      - name: Publish Release (tải APK trực tiếp trên điện thoại)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v1.0.${{ github.run_number }}" dist/*.apk \
+            --repo "${{ github.repository }}" \
+            --title "Quản lý AI v1.0.${{ github.run_number }}" \
+            --notes "Bản build tự động #${{ github.run_number }}"
