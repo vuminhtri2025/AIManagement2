@@ -81,4 +81,3 @@ jobs:
           name: QuanLyAI-apk
           path: dist/*.apk
           if-no-files-found: error
-..
